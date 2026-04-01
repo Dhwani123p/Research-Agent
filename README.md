@@ -1,3 +1,14 @@
+---
+title: Research Agent
+emoji: 🔬
+colorFrom: purple
+colorTo: blue
+sdk: streamlit
+sdk_version: 1.40.0
+app_file: app.py
+pinned: false
+---
+
 # Personal Research Agent
 
 An agentic AI research assistant that plans, searches, evaluates, and synthesises information — so you can ask a complex question and walk away.
