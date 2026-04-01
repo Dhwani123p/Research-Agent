@@ -3,7 +3,7 @@
 import json
 import os
 from typing import Generator
-import anthropic
+import google.generativeai as genai
 
 from agent.prompts import (
     PLANNER_PROMPT,
@@ -18,7 +18,8 @@ from tools.fetch_page import fetch_page, FETCH_PAGE_TOOL
 from tools.arxiv_search import arxiv_search, ARXIV_SEARCH_TOOL
 from tools.pdf_reader import read_pdf, PDF_READER_TOOL
 
-TOOLS = [WEB_SEARCH_TOOL, FETCH_PAGE_TOOL, ARXIV_SEARCH_TOOL, PDF_READER_TOOL]
+MODEL = "gemini-2.0-flash"
+
 TOOL_FUNCTIONS = {
     "web_search": web_search,
     "fetch_page": fetch_page,
@@ -26,15 +27,42 @@ TOOL_FUNCTIONS = {
     "read_pdf": read_pdf,
 }
 
+# Convert tool schemas from Anthropic format → Gemini function declaration format
+def _to_gemini_tools(schemas: list[dict]) -> list[genai.protos.Tool]:
+    declarations = []
+    for s in schemas:
+        declarations.append(
+            genai.protos.FunctionDeclaration(
+                name=s["name"],
+                description=s["description"],
+                parameters=genai.protos.Schema(
+                    type=genai.protos.Type.OBJECT,
+                    properties={
+                        k: genai.protos.Schema(
+                            type=genai.protos.Type[v.get("type", "string").upper()],
+                            description=v.get("description", ""),
+                        )
+                        for k, v in s["input_schema"]["properties"].items()
+                    },
+                    required=s["input_schema"].get("required", []),
+                ),
+            )
+        )
+    return [genai.protos.Tool(function_declarations=declarations)]
+
+
 MAX_EXECUTOR_ITERATIONS = 6
 MAX_CRITIC_RETRIES = 2
 
 
 class ResearchOrchestrator:
     def __init__(self):
-        self.client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
         self.short_term = ShortTermMemory()
         self.long_term = LongTermMemory()
+        self._gemini_tools = _to_gemini_tools(
+            [WEB_SEARCH_TOOL, FETCH_PAGE_TOOL, ARXIV_SEARCH_TOOL, PDF_READER_TOOL]
+        )
 
     def run(self, query: str) -> Generator[dict, None, None]:
         """
@@ -81,7 +109,7 @@ class ResearchOrchestrator:
             if attempt < MAX_CRITIC_RETRIES:
                 missing = evaluation.get("missing", [])
                 yield {"type": "status", "content": f"Research incomplete. Filling gaps: {missing}"}
-                sub_tasks = missing  # retry with only the missing tasks
+                sub_tasks = missing
                 self.short_term.set_sub_tasks(sub_tasks)
                 self.short_term.completed_tasks = []
 
@@ -97,14 +125,11 @@ class ResearchOrchestrator:
         yield {"type": "report", "content": report}
 
     def _plan(self, query: str) -> list[str]:
-        resp = self.client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=512,
-            system=PLANNER_PROMPT,
-            messages=[{"role": "user", "content": query}],
+        model = genai.GenerativeModel(MODEL)
+        resp = model.generate_content(
+            f"{PLANNER_PROMPT}\n\nResearch query: {query}"
         )
-        text = resp.content[0].text.strip()
-        # Strip markdown code fences if present
+        text = resp.text.strip()
         if text.startswith("```"):
             text = text.split("```")[1]
             if text.startswith("json"):
@@ -116,97 +141,102 @@ class ResearchOrchestrator:
             return [query]
 
     def _execute(self, query: str, sub_tasks: list[str], past_block: str) -> Generator[dict, None, None]:
-        messages = [
-            {
-                "role": "user",
-                "content": (
-                    f"Research query: {query}\n\n"
-                    f"Work through these sub-tasks one by one using your tools:\n"
-                    + "\n".join(f"- {t}" for t in sub_tasks)
-                ),
-            }
-        ]
+        model = genai.GenerativeModel(MODEL, tools=self._gemini_tools)
+        chat = model.start_chat()
 
-        for _ in range(MAX_EXECUTOR_ITERATIONS):
+        system = EXECUTOR_SYSTEM_PROMPT.format(
+            query=query,
+            sub_tasks="\n".join(f"- {t}" for t in sub_tasks),
+            past_notes=past_block or "None",
+            current_notes="",
+        )
+
+        initial_message = (
+            f"{system}\n\n"
+            f"Begin researching. Work through each sub-task using your tools."
+        )
+
+        for iteration in range(MAX_EXECUTOR_ITERATIONS):
             pending = self.short_term.pending_tasks()
             if not pending:
                 break
 
-            system = EXECUTOR_SYSTEM_PROMPT.format(
-                query=query,
-                sub_tasks="\n".join(f"- {t}" for t in sub_tasks),
-                past_notes=past_block or "None",
-                current_notes=self.short_term.get_context_block(),
-            )
+            # Update context with current notes for subsequent iterations
+            if iteration == 0:
+                msg = initial_message
+            else:
+                msg = (
+                    f"Continue researching. Pending tasks: {pending}\n\n"
+                    f"Notes gathered so far:\n{self.short_term.get_context_block()[:2000]}"
+                )
 
-            resp = self.client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=2048,
-                system=system,
-                tools=TOOLS,
-                messages=messages,
-            )
+            resp = chat.send_message(msg)
 
-            # Process tool calls
             tool_called = False
-            for block in resp.content:
-                if block.type == "tool_use":
+            for part in resp.parts:
+                if part.function_call:
                     tool_called = True
-                    tool_name = block.name
-                    tool_input = block.input
-                    yield {"type": "status", "content": f"Using tool: {tool_name}({list(tool_input.keys())})"}
+                    fn_name = part.function_call.name
+                    fn_args = dict(part.function_call.args)
 
-                    fn = TOOL_FUNCTIONS.get(tool_name)
+                    yield {"type": "status", "content": f"Using tool: {fn_name}({list(fn_args.keys())})"}
+
+                    fn = TOOL_FUNCTIONS.get(fn_name)
                     if fn:
                         try:
-                            result = fn(**tool_input)
+                            result = fn(**fn_args)
                         except Exception as e:
                             result = {"error": str(e)}
                     else:
-                        result = {"error": f"Unknown tool: {tool_name}"}
+                        result = {"error": f"Unknown tool: {fn_name}"}
 
                     result_str = json.dumps(result, ensure_ascii=False)[:4000]
 
-                    # Store as short-term note
                     source = (
-                        tool_input.get("url")
-                        or tool_input.get("query")
-                        or tool_input.get("source")
-                        or tool_name
+                        fn_args.get("url")
+                        or fn_args.get("query")
+                        or fn_args.get("source")
+                        or fn_name
                     )
-                    self.short_term.add_note(source=source, content=result_str, tool_used=tool_name)
-                    yield {"type": "note", "content": f"[{tool_name}] {source[:80]}"}
+                    self.short_term.add_note(source=source, content=result_str, tool_used=fn_name)
+                    yield {"type": "note", "content": f"[{fn_name}] {str(source)[:80]}"}
 
-                    # Append tool result to messages for next iteration
-                    messages.append({"role": "assistant", "content": resp.content})
-                    messages.append({
-                        "role": "user",
-                        "content": [{"type": "tool_result", "tool_use_id": block.id, "content": result_str}],
-                    })
-                    break  # process one tool at a time
+                    # Send tool result back to model
+                    chat.send_message(
+                        genai.protos.Content(
+                            parts=[
+                                genai.protos.Part(
+                                    function_response=genai.protos.FunctionResponse(
+                                        name=fn_name,
+                                        response={"result": result_str},
+                                    )
+                                )
+                            ]
+                        )
+                    )
+                    break  # one tool at a time
 
             if not tool_called:
-                # Model gave a text response — mark all pending tasks as done
-                text_response = next((b.text for b in resp.content if hasattr(b, "text")), "")
+                # Model gave a text response — mark pending tasks done
                 for task in pending:
                     self.short_term.mark_task_done(task)
-                if text_response:
-                    self.short_term.add_note(source="agent_reasoning", content=text_response, tool_used="reasoning")
+                text_resp = resp.text if hasattr(resp, "text") else ""
+                if text_resp:
+                    self.short_term.add_note(
+                        source="agent_reasoning", content=text_resp, tool_used="reasoning"
+                    )
                 break
 
     def _critique(self, query: str, sub_tasks: list[str]) -> dict:
+        model = genai.GenerativeModel(MODEL)
         prompt = CRITIC_PROMPT.format(
             query=query,
             sub_tasks="\n".join(f"- {t}" for t in sub_tasks),
             completed_tasks="\n".join(f"- {t}" for t in self.short_term.completed_tasks),
             notes=self.short_term.get_context_block()[:3000],
         )
-        resp = self.client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=512,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = resp.content[0].text.strip()
+        resp = model.generate_content(prompt)
+        text = resp.text.strip()
         if text.startswith("```"):
             text = text.split("```")[1]
             if text.startswith("json"):
@@ -217,13 +247,10 @@ class ResearchOrchestrator:
             return {"complete": True, "reason": "Could not parse critic response — proceeding."}
 
     def _synthesize(self, query: str) -> str:
+        model = genai.GenerativeModel(MODEL)
         prompt = SYNTHESIZER_PROMPT.format(
             query=query,
             notes=self.short_term.get_context_block(),
         )
-        resp = self.client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=4096,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return resp.content[0].text.strip()
+        resp = model.generate_content(prompt)
+        return resp.text.strip()

@@ -47,16 +47,16 @@ st.markdown("""
 
 # ── Header ───────────────────────────────────────────────────────────────────
 st.title("Personal Research Agent")
-st.caption("Powered by Claude · Tavily · ChromaDB · ArXiv")
+st.caption("Powered by Gemini 2.0 Flash · Tavily · ChromaDB · ArXiv")
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Configuration")
-    anthropic_key = st.text_input(
-        "Anthropic API Key",
-        value=os.getenv("ANTHROPIC_API_KEY", ""),
+    gemini_key = st.text_input(
+        "Gemini API Key",
+        value=os.getenv("GEMINI_API_KEY", ""),
         type="password",
-        help="Get yours at console.anthropic.com",
+        help="Free key at aistudio.google.com/apikey",
     )
     tavily_key = st.text_input(
         "Tavily API Key",
@@ -64,8 +64,8 @@ with st.sidebar:
         type="password",
         help="Free key at tavily.com",
     )
-    if anthropic_key:
-        os.environ["ANTHROPIC_API_KEY"] = anthropic_key
+    if gemini_key:
+        os.environ["GEMINI_API_KEY"] = gemini_key
     if tavily_key:
         os.environ["TAVILY_API_KEY"] = tavily_key
 
@@ -103,8 +103,8 @@ if run_btn:
     if not query.strip():
         st.warning("Please enter a research query.")
         st.stop()
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        st.error("Anthropic API key is required.")
+    if not os.getenv("GEMINI_API_KEY"):
+        st.error("Gemini API key is required.")
         st.stop()
     if not os.getenv("TAVILY_API_KEY"):
         st.error("Tavily API key is required.")
